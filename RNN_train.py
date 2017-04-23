@@ -6,15 +6,17 @@ reset_default_graph()
 
 
 # Parameters
-learning_rate = 0.01
+learning_rate = 0.001
 training_iters = 3000000
 batch_size = 80
 display_step = 500
-n_embedding = 200
-n_hidden = 100 # hidden layer num of features
+n_embedding = 128
+n_hidden = 64 # hidden layer num of features
+n_attention = 32 # number of units in the attention layer
 n_classes = 2 # linear sequence or not
 n_features = 4096
-penalty_scale = 0.0005
+penalty_scale_l1 = 0.005
+penalty_scale_l2 = 0.005
 # Network Parameters
 
 
@@ -103,19 +105,23 @@ seqlen = tf.placeholder(tf.int32, [None])
 
 # Define weights
 weights = {
-    'in': tf.Variable(tf.random_normal([n_features, n_embedding])),
-    'out': tf.Variable(tf.random_normal([n_hidden, n_classes]))
+    'in': tf.Variable(tf.random_normal([n_features, n_embedding],stddev=0.1)),
+    'out': tf.Variable(tf.random_normal([n_hidden, n_classes],stddev=0.1)),
+    'attention/W': tf.Variable(tf.random_normal([n_hidden, n_attention], stddev=0.1))
+    # Including attention mechanism
 }
 biases = {
-    'in':tf.Variable(tf.random_normal([n_embedding])),
-    'out': tf.Variable(tf.random_normal([n_classes]))
+    'in':tf.Variable(tf.random_normal([n_embedding],stddev=0.1)),
+    'out': tf.Variable(tf.random_normal([n_classes],stddev=0.1)),
+    'attention/b': tf.Variable(tf.random_normal([n_attention], stddev=0.1)),
+    'attention/u': tf.Variable(tf.random_normal([n_attention], stddev=0.1))
 }
 
 
 def dynamicRNN(x, seqlen, weights, biases):
     #use LSTM
     x = tf.unstack(x, seq_max_len, 1)
-    x_embedding = list(map(lambda ts: tf.matmul(ts, weights['in']) + biases['in'], x ))
+    x_embedding = list(map(lambda ts: tf.nn.relu(tf.matmul(ts, weights['in']) + biases['in']), x ))
     lstm_cell = tf.contrib.rnn.BasicLSTMCell(n_hidden)
     outputs, states = tf.contrib.rnn.static_rnn(lstm_cell, x_embedding, dtype=tf.float32,
                                 sequence_length=seqlen)
@@ -127,19 +133,41 @@ def dynamicRNN(x, seqlen, weights, biases):
     # Indexing
     outputs = tf.gather(tf.reshape(outputs, [-1, n_hidden]), index)
     # Linear activation, using outputs computed above
-    return tf.matmul(outputs, weights['out']) + biases['out']
+    return tf.nn.relu(tf.matmul(outputs, weights['out']) + biases['out'])
 
 
-#def dynamicRNN_attention(x, seqlen, weights, biases):
+def dynamicRNN_attention(x, seqlen, weights, biases):
+    #use LSTM
+    x = tf.unstack(x, seq_max_len, 1)
+    x_embedding = list(map(lambda ts: tf.nn.relu(tf.matmul(ts, weights['in']) + biases['in']), x ))
+    
+    lstm_cell = tf.contrib.rnn.BasicLSTMCell(n_hidden)
+    outputs, states = tf.contrib.rnn.static_rnn(lstm_cell, x_embedding, dtype=tf.float32,
+                                sequence_length=seqlen)
+    
+    #outputs = tf.stack(outputs)
+    #print(outputs.get_shape())
+    outputs = tf.transpose(outputs, [1, 0, 2])     
+    v = tf.tanh(tf.matmul(tf.reshape(outputs, [-1, n_hidden]), weights['attention/W']) + tf.reshape(biases['attention/b'], [1, -1]))
+    vu = tf.reshape(tf.matmul(v, tf.reshape(biases['attention/u'], [-1, 1])),[-1])
+    exps = tf.reshape(tf.exp(vu), [-1, seq_max_len])
+    alphas = exps / tf.reshape(tf.reduce_sum(exps, 1), [-1, 1])
+    attention_outputs = tf.reduce_sum(tf.multiply(outputs,tf.reshape(alphas,[-1,seq_max_len, 1])), 1)
+    #print(attention_outputs.get_shape())
+    return tf.nn.relu(tf.matmul(attention_outputs, weights['out']) + biases['out'])
+  
+
+
     
 
-
-pred = dynamicRNN(x, seqlen, weights, biases)
+pred = dynamicRNN_attention(x, seqlen, weights, biases)  #if we use attention in the LSTM
+#pred = dynamicRNN(x, seqlen, weights, biases)   #vanilla LSTM in a dynamic RNN
 # Define loss and optimizer
-cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=pred, labels=y))
-l1_regularizer = tf.contrib.layers.l1_regularizer(scale=penalty_scale, scope=None)
+l1_regularizer = tf.contrib.layers.l1_regularizer(scale=penalty_scale_l1, scope=None)
+l2_regularizer = tf.contrib.layers.l2_regularizer(scale=penalty_scale_l2, scope=None)
 all_variable = tf.trainable_variables() # all vars of your graph
-cost += tf.contrib.layers.apply_regularization(l1_regularizer, all_variable) #use L1 penalty
+cost += (tf.contrib.layers.apply_regularization(l1_regularizer, all_variable) +
+         tf.contrib.layers.apply_regularization(l2_regularizer, all_variable)) #use mixture of L1 and L2 penalty
 
 optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate).minimize(cost)
 
